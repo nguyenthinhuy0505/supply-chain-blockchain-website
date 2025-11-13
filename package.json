@@ -1,0 +1,18 @@
+{
+  "devDependencies": {
+    "@nomicfoundation/hardhat-ignition": "^3.0.5",
+    "@nomicfoundation/hardhat-toolbox-viem": "^5.0.1",
+    "@types/node": "^22.19.1",
+    "chai": "^6.2.1",
+    "ethereum-waffle": "^4.0.10",
+    "ethers": "^5.8.0",
+    "forge-std": "github:foundry-rs/forge-std#v1.9.4",
+    "hardhat": "^3.0.13",
+    "typescript": "~5.8.0",
+    "viem": "^2.39.0"
+  },
+  "type": "module",
+  "dependencies": {
+    "axios": "^1.13.2"
+  }
+}
