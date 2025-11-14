@@ -1,18 +1,30 @@
 {
-  "devDependencies": {
-    "@nomicfoundation/hardhat-ignition": "^3.0.5",
-    "@nomicfoundation/hardhat-toolbox-viem": "^5.0.1",
-    "@types/node": "^22.19.1",
-    "chai": "^6.2.1",
-    "ethereum-waffle": "^4.0.10",
-    "ethers": "^5.8.0",
-    "forge-std": "github:foundry-rs/forge-std#v1.9.4",
-    "hardhat": "^3.0.13",
-    "typescript": "~5.8.0",
-    "viem": "^2.39.0"
+  "name": "supply-chain-blockchain-website",
+  "version": "1.0.0",
+  "scripts": {
+    "compile": "npx hardhat compile",
+    "deploy:rsk": "npx hardhat run scripts/deploy.js --network rootstock_testnet",
+    "deploy:linea": "npx hardhat run scripts/deploy.js --network linea_sepolia",
+    "deploy:mumbai": "npx hardhat run scripts/deploy.js --network mumbai",
+    "deploy:sepolia": "npx hardhat run scripts/deploy.js --network sepolia",
+    "test": "npx hardhat test"
   },
-  "type": "module",
+  "devDependencies": {
+    "@nomicfoundation/hardhat-toolbox": "^4.0.0",
+    "@nomicfoundation/hardhat-ethers": "^3.0.5",
+    "@nomicfoundation/hardhat-chai-matchers": "^2.0.3",
+    "@nomicfoundation/hardhat-network-helpers": "^1.0.10",
+    "@nomicfoundation/hardhat-verify": "^2.0.7",
+    "@typechain/ethers-v6": "^0.5.1",
+    "@typechain/hardhat": "^9.0.1",
+    "hardhat": "^3.0.0",
+    "hardhat-gas-reporter": "^1.0.10",
+    "solidity-coverage": "^0.8.7",
+    "typechain": "^8.3.2"
+  },
   "dependencies": {
-    "axios": "^1.13.2"
+    "@openzeppelin/contracts": "^4.9.3",
+    "dotenv": "^16.3.1",
+    "ethers": "^6.8.1"
   }
 }
