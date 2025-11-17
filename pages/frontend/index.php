@@ -173,7 +173,7 @@ $currentUser = isset($_SESSION['user_info']) ? $_SESSION['user_info'] : null;
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>BlockChain Supply - Hệ thống chuỗi cung ứng thông minh</title>
+    <title>SupplyChain - Hệ thống chuỗi cung ứng thông minh</title>
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     <style>
         :root {
@@ -1727,6 +1727,21 @@ $currentUser = isset($_SESSION['user_info']) ? $_SESSION['user_info'] : null;
                     <h3>Phân tích thông minh</h3>
                     <p>Hệ thống phân tích dữ liệu thông minh giúp tối ưu hóa chuỗi cung ứng và dự báo nhu cầu</p>
                 </div>
+                <div class="feature-card">
+                    <div class="feature-icon">
+                       <i class="fas fa-leaf"></i>
+                    </div>
+                    <h3>Bền vững môi trường</h3>
+                    <p>Theo dõi và báo cáo tác động môi trường của chuỗi cung ứng, hỗ trợ các mục tiêu phát triển bền vững</p>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon">
+                      <i class="fas fa-mobile-alt"></i>
+                    </div>
+                    <h3>Ứng dụng di động</h3>
+                    <p>Truy cập và quản lý chuỗi cung ứng mọi lúc, mọi nơi với ứng dụng di động thân thiện và tiện lợi</p>
+            </div>
+        
             </div>
         </div>
     </section>

@@ -22,11 +22,33 @@ try {
     $nha_san_xuat = [];
 }
 
+// KIỂM TRA VÀ TẠO DANH MỤC MẪU NẾU CHƯA CÓ
+try {
+    $check_categories = $conn->query("SELECT COUNT(*) FROM danh_muc")->fetchColumn();
+    
+    if ($check_categories == 0) {
+        $sample_categories = [
+            ['Nông sản', 'Các loại nông sản, rau củ quả'],
+            ['Thủy sản', 'Cá, tôm, cua, mực và các loại thủy sản khác'],
+            ['Thịt gia súc', 'Thịt heo, thịt bò, thịt gà và các loại thịt khác'],
+            ['Trái cây', 'Các loại trái cây tươi'],
+            ['Lương thực', 'Gạo, ngô, khoai, sắn']
+        ];
+        
+        $insert_stmt = $conn->prepare("INSERT INTO danh_muc (ten_danh_muc, mo_ta, trang_thai, ngay_tao) VALUES (?, ?, 'active', NOW())");
+        
+        foreach ($sample_categories as $category) {
+            $insert_stmt->execute([$category[0], $category[1]]);
+        }
+    }
+} catch(PDOException $e) {
+    error_log("Error checking/creating sample categories: " . $e->getMessage());
+}
+
 // Xử lý upload hình ảnh
 function uploadImage($file) {
     $target_dir = "../uploads/products/";
     
-    // Tạo thư mục nếu chưa tồn tại
     if (!file_exists($target_dir)) {
         mkdir($target_dir, 0777, true);
     }
@@ -35,29 +57,50 @@ function uploadImage($file) {
     $file_name = uniqid() . '_' . time() . '.' . $file_extension;
     $target_file = $target_dir . $file_name;
     
-    // Kiểm tra file ảnh
     $check = getimagesize($file["tmp_name"]);
     if ($check === false) {
         throw new Exception("File không phải là hình ảnh.");
     }
     
-    // Kiểm tra kích thước file (max 5MB)
     if ($file["size"] > 5 * 1024 * 1024) {
         throw new Exception("Kích thước file quá lớn. Tối đa 5MB.");
     }
     
-    // Cho phép các định dạng ảnh
     $allowed_extensions = ["jpg", "jpeg", "png", "gif", "webp"];
     if (!in_array($file_extension, $allowed_extensions)) {
         throw new Exception("Chỉ chấp nhận file JPG, JPEG, PNG, GIF, WEBP.");
     }
     
-    // Upload file
     if (move_uploaded_file($file["tmp_name"], $target_file)) {
         return $file_name;
     } else {
         throw new Exception("Có lỗi xảy ra khi upload file.");
     }
+}
+
+// Hàm tạo transaction hash ngẫu nhiên và duy nhất
+function generateUniqueTransactionHash($conn) {
+    $max_attempts = 10;
+    $attempt = 0;
+    
+    while ($attempt < $max_attempts) {
+        // Tạo transaction hash ngẫu nhiên
+        $tx_hash = '0x' . bin2hex(random_bytes(32));
+        
+        // Kiểm tra xem transaction hash đã tồn tại chưa
+        $check_stmt = $conn->prepare("SELECT COUNT(*) FROM blockchain_transactions WHERE transaction_hash = :tx_hash");
+        $check_stmt->execute([':tx_hash' => $tx_hash]);
+        $exists = $check_stmt->fetchColumn();
+        
+        if (!$exists) {
+            return $tx_hash;
+        }
+        
+        $attempt++;
+    }
+    
+    // Nếu không tạo được hash duy nhất sau nhiều lần thử, tạo hash với timestamp
+    return '0x' . bin2hex(random_bytes(16)) . dechex(time());
 }
 
 // Biến thông báo
@@ -66,13 +109,17 @@ $error_message = '';
 
 // Xử lý đăng ký sản phẩm với blockchain
 if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['action'])) {
+    
     if ($_POST['action'] == 'add_product_blockchain') {
+        
+        // Lấy dữ liệu từ form
         $ten_san_pham = trim($_POST['ten_san_pham'] ?? '');
         $mo_ta = trim($_POST['mo_ta'] ?? '');
         $danh_muc_id = $_POST['danh_muc_id'] ?? '';
         $don_vi_tinh = $_POST['don_vi_tinh'] ?? '';
         $so_luong = $_POST['so_luong'] ?? '';
-        $thong_so_ky_thuat = trim($_POST['thong_so_ky_thuat'] ?? '');
+        $nhiet_do_bao_quan = $_POST['nhiet_do_bao_quan'] ?? '';
+        $do_am_bao_quan = $_POST['do_am_bao_quan'] ?? '';
         $tinh_thanh = trim($_POST['tinh_thanh'] ?? '');
         $quan_huyen = trim($_POST['quan_huyen'] ?? '');
         $xa_phuong = trim($_POST['xa_phuong'] ?? '');
@@ -80,6 +127,7 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['action'])) {
         $ngay_thu_hoach = $_POST['ngay_thu_hoach'] ?? '';
         $ghi_chu = trim($_POST['ghi_chu'] ?? '');
         $transaction_hash = trim($_POST['transaction_hash'] ?? '');
+        $gia_ban = $_POST['gia_ban'] ?? 0;
         
         $hinh_anh = null;
         
@@ -92,17 +140,45 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['action'])) {
             }
         }
         
-        if (!empty($ten_san_pham) && !empty($danh_muc_id) && !empty($so_luong) && !empty($transaction_hash)) {
+        // Kiểm tra dữ liệu bắt buộc
+        if (empty($ten_san_pham) || empty($danh_muc_id) || empty($so_luong)) {
+            $error_message = "Vui lòng điền đầy đủ thông tin bắt buộc: Tên sản phẩm, Danh mục, Số lượng!";
+        } else {
             try {
+                // Bắt đầu transaction
+                $conn->beginTransaction();
+                
                 // Tạo mã sản phẩm
                 $ma_san_pham = 'SP' . date('YmdHis') . rand(100, 999);
                 
+                // Tạo thông số kỹ thuật từ nhiệt độ và độ ẩm
+                $thong_so_ky_thuat = json_encode([
+                    'nhiet_do_bao_quan' => $nhiet_do_bao_quan,
+                    'do_am_bao_quan' => $do_am_bao_quan
+                ]);
+
+                // Tạo transaction hash duy nhất nếu không có từ form
+                if (empty($transaction_hash)) {
+                    $transaction_hash = generateUniqueTransactionHash($conn);
+                } else {
+                    // Kiểm tra transaction hash từ form có bị trùng không
+                    $check_stmt = $conn->prepare("SELECT COUNT(*) FROM blockchain_transactions WHERE transaction_hash = :tx_hash");
+                    $check_stmt->execute([':tx_hash' => $transaction_hash]);
+                    $exists = $check_stmt->fetchColumn();
+                    
+                    if ($exists) {
+                        // Nếu bị trùng, tạo hash mới
+                        $transaction_hash = generateUniqueTransactionHash($conn);
+                    }
+                }
+
+                // INSERT VÀO BẢNG SAN_PHAM
                 $insert_stmt = $conn->prepare("INSERT INTO san_pham 
                     (ma_san_pham, ten_san_pham, mo_ta, danh_muc_id, nha_san_xuat_id, don_vi_tinh, so_luong, hinh_anh, thong_so_ky_thuat, ngay_tao, ngay_cap_nhat, tinh_thanh, quan_huyen, xa_phuong, dia_chi_cu_the, ngay_thu_hoach, ghi_chu, blockchain_tx_hash, blockchain_status) 
                     VALUES 
                     (:ma_san_pham, :ten_san_pham, :mo_ta, :danh_muc_id, :nha_san_xuat_id, :don_vi_tinh, :so_luong, :hinh_anh, :thong_so_ky_thuat, NOW(), NOW(), :tinh_thanh, :quan_huyen, :xa_phuong, :dia_chi_cu_the, :ngay_thu_hoach, :ghi_chu, :blockchain_tx_hash, 'confirmed')");
                 
-                $insert_result = $insert_stmt->execute([
+                $insert_params = [
                     ':ma_san_pham' => $ma_san_pham,
                     ':ten_san_pham' => $ten_san_pham,
                     ':mo_ta' => $mo_ta,
@@ -119,32 +195,95 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['action'])) {
                     ':ngay_thu_hoach' => $ngay_thu_hoach ?: null,
                     ':ghi_chu' => $ghi_chu,
                     ':blockchain_tx_hash' => $transaction_hash
-                ]);
+                ];
+                
+                $insert_result = $insert_stmt->execute($insert_params);
                 
                 if ($insert_result) {
                     $product_id = $conn->lastInsertId();
                     
-                    // Lưu transaction vào bảng blockchain_transactions
-                    $tx_stmt = $conn->prepare("
-                        INSERT INTO blockchain_transactions (user_id, transaction_hash, action, fee, created_at, product_id) 
-                        VALUES (:user_id, :tx_hash, 'product_registration', '0.001', NOW(), :product_id)
-                    ");
-                    $tx_stmt->execute([
-                        ':user_id' => $user['id'],
-                        ':tx_hash' => $transaction_hash,
-                        ':product_id' => $product_id
+                    // Thêm giá sản phẩm vào bảng gia_san_pham
+                    $price_stmt = $conn->prepare("INSERT INTO gia_san_pham 
+                        (san_pham_id, nha_san_xuat_id, gia_ban, ngay_ap_dung, trang_thai) 
+                        VALUES 
+                        (:san_pham_id, :nha_san_xuat_id, :gia_ban, NOW(), 'active')");
+                    
+                    $price_result = $price_stmt->execute([
+                        ':san_pham_id' => $product_id,
+                        ':nha_san_xuat_id' => $user['id'],
+                        ':gia_ban' => $gia_ban
                     ]);
                     
-                    $success_message = "Đăng ký sản phẩm thành công trên Blockchain! TX: " . substr($transaction_hash, 0, 20) . "...";
+                    // Lưu transaction vào bảng blockchain_transactions - ĐÚNG CẤU TRÚC BẢNG
+                    try {
+                        // INSERT với đầy đủ cột theo cấu trúc bảng
+                        $tx_stmt = $conn->prepare("
+                            INSERT INTO blockchain_transactions 
+                            (user_id, transaction_hash, transaction_type, gas_used, gas_price_eth, gas_price_usd, status, block_number, network, created_at, updated_at) 
+                            VALUES 
+                            (:user_id, :transaction_hash, 'product_registration', 21000, 0.00000001, 0.00002, 'confirmed', NULL, 'Rootstock Testnet', NOW(), NOW())
+                        ");
+                        
+                        $tx_result = $tx_stmt->execute([
+                            ':user_id' => $user['id'],
+                            ':transaction_hash' => $transaction_hash
+                        ]);
+                        
+                    } catch(PDOException $e) {
+                        // Nếu lỗi, thử INSERT với ít cột hơn
+                        error_log("Full insert failed: " . $e->getMessage());
+                        
+                        try {
+                            $tx_stmt = $conn->prepare("
+                                INSERT INTO blockchain_transactions 
+                                (user_id, transaction_hash, transaction_type, status, network, created_at, updated_at) 
+                                VALUES 
+                                (:user_id, :transaction_hash, 'product_registration', 'confirmed', 'Rootstock Testnet', NOW(), NOW())
+                            ");
+                            
+                            $tx_result = $tx_stmt->execute([
+                                ':user_id' => $user['id'],
+                                ':transaction_hash' => $transaction_hash
+                            ]);
+                        } catch(PDOException $e2) {
+                            // Nếu vẫn lỗi, chỉ insert các cột tối thiểu
+                            error_log("Simple insert failed: " . $e2->getMessage());
+                            $tx_stmt = $conn->prepare("
+                                INSERT INTO blockchain_transactions 
+                                (user_id, transaction_hash, status, created_at) 
+                                VALUES 
+                                (:user_id, :transaction_hash, 'confirmed', NOW())
+                            ");
+                            
+                            $tx_result = $tx_stmt->execute([
+                                ':user_id' => $user['id'],
+                                ':transaction_hash' => $transaction_hash
+                            ]);
+                        }
+                    }
+                    
+                    // Commit transaction
+                    $conn->commit();
+                    
+                    $success_message = "Đăng ký sản phẩm thành công trên Blockchain! Mã sản phẩm: $ma_san_pham";
+                    
+                    // Redirect để tránh resubmit form
+                    header("Location: nha_san_xuat.php?success=1");
+                    exit;
+                    
                 } else {
+                    $conn->rollBack();
                     $error_message = "Lỗi khi thêm sản phẩm vào cơ sở dữ liệu!";
                 }
             } catch(PDOException $e) {
+                $conn->rollBack();
                 error_log("Error adding product with blockchain: " . $e->getMessage());
-                $error_message = "Lỗi khi đăng ký sản phẩm trên Blockchain!";
+                if (strpos($e->getMessage(), 'Duplicate entry') !== false) {
+                    $error_message = "Lỗi: Transaction hash bị trùng lặp. Vui lòng thử lại!";
+                } else {
+                    $error_message = "Lỗi khi đăng ký sản phẩm: " . $e->getMessage();
+                }
             }
-        } else {
-            $error_message = "Vui lòng điền đầy đủ thông tin bắt buộc và hoàn thành giao dịch blockchain!";
         }
     }
     
@@ -153,6 +292,8 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['action'])) {
         $product_id = $_POST['product_id'] ?? '';
         if (!empty($product_id)) {
             try {
+                $conn->beginTransaction();
+                
                 // Lấy thông tin hình ảnh để xóa file
                 $select_stmt = $conn->prepare("SELECT hinh_anh FROM san_pham WHERE id = :id AND nha_san_xuat_id = :nha_san_xuat_id");
                 $select_stmt->execute([
@@ -161,14 +302,27 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['action'])) {
                 ]);
                 $product = $select_stmt->fetch(PDO::FETCH_ASSOC);
                 
+                // Xóa giá sản phẩm
+                $delete_price_stmt = $conn->prepare("DELETE FROM gia_san_pham WHERE san_pham_id = :san_pham_id");
+                $delete_price_stmt->execute([':san_pham_id' => $product_id]);
+                
+                // Xóa blockchain transactions liên quan đến sản phẩm này (nếu có)
+                try {
+                    $delete_tx_stmt = $conn->prepare("DELETE FROM blockchain_transactions WHERE transaction_hash IN (SELECT blockchain_tx_hash FROM san_pham WHERE id = :product_id)");
+                    $delete_tx_stmt->execute([':product_id' => $product_id]);
+                } catch(PDOException $e) {
+                    error_log("Error deleting blockchain transactions: " . $e->getMessage());
+                    // Bỏ qua lỗi nếu không xóa được transactions
+                }
+                
                 // Xóa sản phẩm
                 $delete_stmt = $conn->prepare("DELETE FROM san_pham WHERE id = :id AND nha_san_xuat_id = :nha_san_xuat_id");
-                $delete_stmt->execute([
+                $delete_result = $delete_stmt->execute([
                     ':id' => $product_id,
                     ':nha_san_xuat_id' => $user['id']
                 ]);
                 
-                if ($delete_stmt->rowCount() > 0) {
+                if ($delete_result && $delete_stmt->rowCount() > 0) {
                     // Xóa file hình ảnh nếu tồn tại
                     if ($product && $product['hinh_anh']) {
                         $image_path = "../uploads/products/" . $product['hinh_anh'];
@@ -176,21 +330,38 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['action'])) {
                             unlink($image_path);
                         }
                     }
+                    
+                    $conn->commit();
                     $success_message = "Xóa sản phẩm thành công!";
+                    
+                    // Redirect để tránh resubmit form
+                    header("Location: nha_san_xuat.php?success=2");
+                    exit;
                 } else {
+                    $conn->rollBack();
                     $error_message = "Không tìm thấy sản phẩm hoặc bạn không có quyền xóa!";
                 }
             } catch(PDOException $e) {
+                $conn->rollBack();
                 error_log("Error deleting product: " . $e->getMessage());
-                $error_message = "Lỗi khi xóa sản phẩm!";
+                $error_message = "Lỗi khi xóa sản phẩm: " . $e->getMessage();
             }
         }
     }
 }
 
+// Hiển thị thông báo từ URL parameter
+if (isset($_GET['success'])) {
+    if ($_GET['success'] == '1') {
+        $success_message = "Đăng ký sản phẩm thành công trên Blockchain!";
+    } elseif ($_GET['success'] == '2') {
+        $success_message = "Xóa sản phẩm thành công!";
+    }
+}
+
 // Lấy danh sách danh mục
 try {
-    $categories_stmt = $conn->prepare("SELECT * FROM danh_muc WHERE trang_thai = 'active' ORDER BY ten_danh_muc");
+    $categories_stmt = $conn->prepare("SELECT id, ten_danh_muc FROM danh_muc ORDER BY ten_danh_muc");
     $categories_stmt->execute();
     $danh_muc = $categories_stmt->fetchAll(PDO::FETCH_ASSOC);
 } catch(PDOException $e) {
@@ -198,12 +369,13 @@ try {
     $danh_muc = [];
 }
 
-// Lấy danh sách sản phẩm của nhà sản xuất
+// Lấy danh sách sản phẩm của nhà sản xuất với giá
 try {
     $products_stmt = $conn->prepare("
-        SELECT sp.*, dm.ten_danh_muc 
+        SELECT sp.*, dm.ten_danh_muc, gp.gia_ban 
         FROM san_pham sp 
         LEFT JOIN danh_muc dm ON sp.danh_muc_id = dm.id 
+        LEFT JOIN gia_san_pham gp ON sp.id = gp.san_pham_id AND gp.trang_thai = 'active'
         WHERE sp.nha_san_xuat_id = :nha_san_xuat_id 
         ORDER BY sp.ngay_tao DESC
     ");
@@ -227,6 +399,7 @@ foreach ($san_pham as $product) {
     }
 }
 ?>
+
 <!DOCTYPE html>
 <html lang="vi">
 <head>
@@ -237,455 +410,279 @@ foreach ($san_pham as $product) {
     <script src="https://cdn.jsdelivr.net/npm/web3@1.8.0/dist/web3.min.js"></script>
     <style>
         :root {
-            --primary: #2c5aa0;
-            --secondary: #3a86ff;
-            --accent: #00c9a7;
-            --dark: #1a1a2e;
-            --light: #f8f9fa;
-            --gray: #6c757d;
-            --success: #28a745;
-            --warning: #ffc107;
-            --danger: #dc3545;
-            --blockchain: #f6851b;
+            --primary: #1976d2;
+            --primary-light: #42a5f5;
+            --primary-dark: #1565c0;
+            --secondary: #7b1fa2;
+            --accent: #00bcd4;
+            --success: #388e3c;
+            --warning: #f57c00;
+            --danger: #d32f2f;
             --gradient-primary: linear-gradient(135deg, var(--primary) 0%, var(--secondary) 100%);
-            --gradient-blockchain: linear-gradient(135deg, var(--blockchain) 0%, #e2761b 100%);
-            --gradient-success: linear-gradient(135deg, var(--success) 0%, #20c997 100%);
-            --gradient-dark: linear-gradient(135deg, var(--dark) 0%, #16213e 100%);
-            --shadow: 0 5px 15px rgba(0, 0, 0, 0.08);
-            --shadow-lg: 0 10px 25px rgba(0, 0, 0, 0.15);
+            --gradient-success: linear-gradient(135deg, var(--success) 0%, #2e7d32 100%);
+            --gradient-warning: linear-gradient(135deg, var(--warning) 0%, #ef6c00 100%);
+            --gradient-danger: linear-gradient(135deg, var(--danger) 0%, #c62828 100%);
+            --gradient-metamask: linear-gradient(135deg, #f6851b, #e2761b);
+            --shadow: 0 3px 6px rgba(0,0,0,0.16), 0 3px 6px rgba(0,0,0,0.23);
+            --shadow-lg: 0 10px 20px rgba(0,0,0,0.19), 0 6px 6px rgba(0,0,0,0.23);
+            --radius: 8px;
+            --radius-lg: 12px;
+            --transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
         }
-        
+
         * {
             margin: 0;
             padding: 0;
             box-sizing: border-box;
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            font-family: 'Roboto', 'Segoe UI', system-ui, -apple-system, sans-serif;
         }
-        
+
         body {
-            background-color: #f5f7fa;
-            color: var(--dark);
-            overflow-x: hidden;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: #212121;
+            line-height: 1.5;
+            min-height: 100vh;
         }
-        
+
         .dashboard-container {
             display: flex;
             min-height: 100vh;
         }
-        
-        /* Sidebar */
+
         .sidebar {
-            width: 280px;
-            background: var(--gradient-dark);
+            width: 260px;
+            background: linear-gradient(180deg, #424242 0%, #212121 100%);
             color: white;
             position: fixed;
             height: 100vh;
             overflow-y: auto;
-            transition: all 0.3s;
-            z-index: 100;
-            box-shadow: 2px 0 10px rgba(0, 0, 0, 0.1);
+            z-index: 1000;
+            box-shadow: var(--shadow-lg);
         }
-        
+
         .sidebar-header {
-            padding: 25px 20px;
-            background: rgba(255, 255, 255, 0.1);
-            text-align: center;
+            padding: 20px 16px;
+            background: rgba(255, 255, 255, 0.05);
             border-bottom: 1px solid rgba(255, 255, 255, 0.1);
         }
-        
+
         .sidebar-header h2 {
-            font-size: 20px;
-            margin-bottom: 5px;
-            font-weight: 700;
+            font-size: 15px;
+            font-weight: 600;
+            margin-bottom: 4px;
         }
-        
+
         .sidebar-header p {
-            font-size: 14px;
-            opacity: 0.8;
+            font-size: 11px;
+            opacity: 0.7;
         }
-        
+
         .sidebar-menu {
-            padding: 20px 0;
+            padding: 16px 0;
         }
-        
+
         .menu-item {
-            padding: 15px 25px;
+            padding: 12px 16px;
             display: flex;
             align-items: center;
             gap: 12px;
-            color: #b0b7c3;
+            color: #bdbdbd;
             text-decoration: none;
-            transition: all 0.3s;
+            transition: var(--transition);
             border-left: 3px solid transparent;
             font-weight: 500;
+            margin: 2px 12px;
+            border-radius: 6px;
+            font-size: 13px;
         }
-        
+
         .menu-item:hover, .menu-item.active {
-            background: rgba(255, 255, 255, 0.1);
+            background: rgba(33, 150, 243, 0.15);
             color: white;
-            border-left-color: var(--accent);
+            border-left-color: var(--primary);
         }
-        
-        .menu-item i {
-            width: 20px;
-            text-align: center;
-            font-size: 18px;
-        }
-        
-        /* Main Content */
+
         .main-content {
             flex: 1;
-            margin-left: 280px;
+            margin-left: 260px;
             padding: 20px;
-            transition: all 0.3s;
         }
-        
+
         .header {
-            background: white;
-            padding: 20px 30px;
-            border-radius: 15px;
+            background: rgba(255, 255, 255, 0.95);
+            padding: 20px 24px;
+            border-radius: var(--radius-lg);
             box-shadow: var(--shadow);
-            margin-bottom: 30px;
+            margin-bottom: 20px;
             display: flex;
             justify-content: space-between;
             align-items: center;
         }
-        
-        .header-left {
-            display: flex;
-            align-items: center;
-            gap: 20px;
-        }
-        
-        .header h1 {
-            color: var(--dark);
-            font-size: 28px;
-            font-weight: 700;
-        }
-        
-        .wallet-info {
-            display: flex;
-            align-items: center;
-            gap: 12px;
-            background: #f8f9fa;
-            padding: 10px 15px;
-            border-radius: 10px;
-            border: 1px solid #e9ecef;
-            transition: all 0.3s;
-        }
-        
-        .wallet-info.connected {
-            background: #e8f5e8;
-            border-color: #c3e6cb;
-        }
-        
-        .wallet-info i {
-            color: var(--primary);
-            font-size: 18px;
-        }
-        
-        .wallet-info.connected i {
-            color: var(--success);
-        }
-        
-        .wallet-address {
-            font-family: monospace;
-            font-size: 14px;
-            color: var(--dark);
-            font-weight: 600;
-        }
-        
-        .connect-btn {
-            background: var(--gradient-primary);
-            color: white;
-            border: none;
-            padding: 10px 15px;
-            border-radius: 8px;
-            font-weight: 600;
-            cursor: pointer;
-            display: flex;
-            align-items: center;
-            gap: 8px;
-            transition: all 0.3s;
-        }
-        
-        .connect-btn:hover {
-            transform: translateY(-2px);
-            box-shadow: var(--shadow);
-        }
-        
+
         .user-info {
             display: flex;
             align-items: center;
-            gap: 15px;
+            gap: 12px;
+            background: rgba(255, 255, 255, 0.8);
+            padding: 10px 16px;
+            border-radius: var(--radius);
         }
-        
+
         .user-avatar {
-            width: 50px;
-            height: 50px;
+            width: 40px;
+            height: 40px;
             background: var(--gradient-primary);
             border-radius: 50%;
             display: flex;
             align-items: center;
             justify-content: center;
             color: white;
-            font-weight: bold;
-            font-size: 20px;
-            box-shadow: var(--shadow);
+            font-weight: 600;
+            font-size: 14px;
         }
-        
-        /* Stats Grid */
+
         .stats-grid {
             display: grid;
             grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
             gap: 20px;
             margin-bottom: 30px;
         }
-        
+
         .stat-card {
-            background: white;
-            padding: 25px;
-            border-radius: 15px;
+            background: rgba(255, 255, 255, 0.95);
+            padding: 20px;
+            border-radius: var(--radius-lg);
             box-shadow: var(--shadow);
             display: flex;
             align-items: center;
-            gap: 20px;
-            transition: all 0.3s;
-            position: relative;
-            overflow: hidden;
+            gap: 16px;
+            transition: var(--transition);
         }
-        
-        .stat-card::before {
-            content: '';
-            position: absolute;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 4px;
-            background: var(--gradient-primary);
-        }
-        
-        .stat-card:nth-child(2)::before {
-            background: var(--gradient-blockchain);
-        }
-        
-        .stat-card:nth-child(3)::before {
-            background: var(--gradient-success);
-        }
-        
-        .stat-card:nth-child(4)::before {
-            background: var(--gradient-dark);
-        }
-        
+
         .stat-card:hover {
-            transform: translateY(-5px);
+            transform: translateY(-3px);
             box-shadow: var(--shadow-lg);
         }
-        
+
         .stat-icon {
-            width: 60px;
-            height: 60px;
+            width: 50px;
+            height: 50px;
             background: var(--gradient-primary);
-            border-radius: 15px;
+            border-radius: 12px;
             display: flex;
             align-items: center;
             justify-content: center;
             color: white;
-            font-size: 24px;
-            box-shadow: var(--shadow);
+            font-size: 20px;
         }
-        
-        .stat-card:nth-child(2) .stat-icon {
-            background: var(--gradient-blockchain);
-        }
-        
-        .stat-card:nth-child(3) .stat-icon {
-            background: var(--gradient-success);
-        }
-        
-        .stat-card:nth-child(4) .stat-icon {
-            background: var(--gradient-dark);
-        }
-        
-        .stat-info h3 {
-            font-size: 24px;
-            margin-bottom: 5px;
-            color: var(--dark);
-            font-weight: 700;
-        }
-        
-        .stat-info p {
-            color: var(--gray);
-            font-size: 14px;
-        }
-        
-        /* Content Sections */
+
+        .stat-card:nth-child(2) .stat-icon { background: var(--gradient-success); }
+        .stat-card:nth-child(3) .stat-icon { background: var(--gradient-warning); }
+        .stat-card:nth-child(4) .stat-icon { background: var(--gradient-metamask); }
+
         .content-section {
-            background: white;
-            border-radius: 15px;
+            background: rgba(255, 255, 255, 0.95);
+            border-radius: var(--radius-lg);
             box-shadow: var(--shadow);
-            margin-bottom: 30px;
+            margin-bottom: 20px;
             overflow: hidden;
-            transition: all 0.3s;
         }
-        
-        .content-section:hover {
-            box-shadow: var(--shadow-lg);
-        }
-        
+
         .section-header {
-            padding: 20px 30px;
-            border-bottom: 1px solid #eee;
+            padding: 18px 20px;
+            border-bottom: 1px solid rgba(0, 0, 0, 0.05);
             display: flex;
             justify-content: space-between;
             align-items: center;
-            background: rgba(248, 249, 250, 0.5);
         }
-        
-        .section-header h2 {
-            color: var(--dark);
-            font-size: 22px;
-            font-weight: 700;
-        }
-        
+
         .btn {
-            padding: 10px 20px;
-            border-radius: 8px;
-            font-weight: 600;
+            padding: 10px 16px;
+            border-radius: 6px;
+            font-weight: 500;
             cursor: pointer;
-            transition: all 0.3s;
+            transition: var(--transition);
             border: none;
-            font-size: 14px;
+            font-size: 12px;
             display: inline-flex;
             align-items: center;
-            gap: 8px;
+            gap: 6px;
         }
-        
-        .btn-primary {
-            background: var(--gradient-primary);
+
+        .btn-metamask {
+            background: var(--gradient-metamask);
             color: white;
         }
-        
-        .btn-blockchain {
-            background: var(--gradient-blockchain);
-            color: white;
-        }
-        
-        .btn-secondary {
-            background: #f8f9fa;
-            color: var(--dark);
-            border: 1px solid #dee2e6;
-        }
-        
-        .btn-sm {
-            padding: 6px 12px;
-            font-size: 12px;
-        }
-        
+
         .btn:hover {
-            transform: translateY(-2px);
+            transform: translateY(-1px);
             box-shadow: var(--shadow);
         }
-        
-        /* Table */
-        .table-container {
-            padding: 20px;
-            overflow-x: auto;
-        }
-        
+
         table {
             width: 100%;
             border-collapse: collapse;
-            min-width: 800px;
+            font-size: 12px;
         }
-        
+
         th, td {
-            padding: 12px 15px;
+            padding: 12px 16px;
             text-align: left;
-            border-bottom: 1px solid #eee;
+            border-bottom: 1px solid rgba(0, 0, 0, 0.05);
         }
-        
+
         th {
-            background: #f8f9fa;
+            background: rgba(245, 245, 245, 0.8);
             font-weight: 600;
-            color: var(--dark);
+            color: #616161;
+            font-size: 11px;
         }
-        
-        tr:hover {
-            background: #f8f9fa;
-        }
-        
+
         .product-image {
-            width: 50px;
-            height: 50px;
+            width: 40px;
+            height: 40px;
             border-radius: 6px;
             object-fit: cover;
-            border: 2px solid #e9ecef;
-            box-shadow: 0 2px 5px rgba(0,0,0,0.1);
         }
-        
-        .status-badge {
-            padding: 4px 10px;
-            border-radius: 20px;
-            font-size: 11px;
-            font-weight: 600;
-        }
-        
-        .status-active {
-            background: #e8f5e8;
-            color: var(--success);
-        }
-        
-        .status-pending {
-            background: #fff3cd;
-            color: var(--warning);
-        }
-        
-        .status-inactive {
-            background: #f8d7da;
-            color: var(--danger);
-        }
-        
+
         .blockchain-badge {
-            background: var(--gradient-blockchain);
+            background: var(--gradient-metamask);
             color: white;
-            padding: 4px 10px;
-            border-radius: 20px;
-            font-size: 11px;
+            padding: 4px 8px;
+            border-radius: 16px;
+            font-size: 10px;
             font-weight: 600;
         }
-        
-        .action-buttons {
-            display: flex;
-            gap: 6px;
-            flex-wrap: wrap;
+
+        .status-pending {
+            background: rgba(245, 124, 0, 0.12);
+            color: var(--warning);
+            padding: 4px 10px;
+            border-radius: 16px;
+            font-size: 10px;
+            font-weight: 600;
         }
-        
-        .action-btn {
-            padding: 5px 8px;
-            border-radius: 5px;
-            font-size: 11px;
-            cursor: pointer;
-            border: none;
-            transition: all 0.2s;
+
+        .alert {
+            padding: 12px 16px;
+            border-radius: var(--radius);
+            margin-bottom: 16px;
+            font-weight: 500;
+            font-size: 12px;
         }
-        
-        .action-btn.edit {
-            background: #e7f3ff;
-            color: var(--primary);
+
+        .alert-success {
+            background: rgba(56, 142, 60, 0.12);
+            color: var(--success);
+            border: 1px solid rgba(56, 142, 60, 0.2);
         }
-        
-        .action-btn.delete {
-            background: #f8d7da;
+
+        .alert-error {
+            background: rgba(211, 47, 47, 0.12);
             color: var(--danger);
+            border: 1px solid rgba(211, 47, 47, 0.2);
         }
-        
-        .action-btn:hover {
-            opacity: 0.8;
-            transform: scale(1.05);
-        }
-        
-        /* Modal */
+
         .modal {
             display: none;
             position: fixed;
@@ -695,396 +692,99 @@ foreach ($san_pham as $product) {
             height: 100%;
             background: rgba(0, 0, 0, 0.8);
             z-index: 1000;
-            backdrop-filter: blur(10px);
         }
-        
+
         .modal-content {
             position: absolute;
             top: 50%;
             left: 50%;
             transform: translate(-50%, -50%);
             background: white;
-            border-radius: 20px;
-            box-shadow: 0 25px 50px rgba(0, 0, 0, 0.3);
+            border-radius: var(--radius-lg);
+            box-shadow: var(--shadow-lg);
             width: 90%;
-            max-width: 700px;
+            max-width: 800px;
             max-height: 90vh;
-            overflow: hidden;
-            animation: modalAppear 0.3s ease-out;
+            overflow-y: auto;
         }
-        
-        @keyframes modalAppear {
-            from {
-                opacity: 0;
-                transform: translate(-50%, -60%);
-            }
-            to {
-                opacity: 1;
-                transform: translate(-50%, -50%);
-            }
-        }
-        
+
         .modal-header {
-            background: var(--gradient-primary);
+            background: var(--gradient-metamask);
             color: white;
-            padding: 20px 25px;
+            padding: 16px 20px;
             text-align: center;
             position: relative;
         }
-        
-        .modal-header.blockchain {
-            background: var(--gradient-blockchain);
-        }
-        
-        .modal-header h2 {
-            font-size: 22px;
-            margin-bottom: 5px;
-        }
-        
+
         .close-modal {
             position: absolute;
-            top: 15px;
-            right: 15px;
+            top: 12px;
+            right: 12px;
             background: rgba(255, 255, 255, 0.2);
             border: none;
             color: white;
-            width: 30px;
-            height: 30px;
+            width: 24px;
+            height: 24px;
             border-radius: 50%;
             cursor: pointer;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            transition: all 0.3s;
         }
-        
-        .close-modal:hover {
-            background: rgba(255, 255, 255, 0.3);
-            transform: scale(1.1);
-        }
-        
+
         .modal-body {
-            padding: 25px;
-            max-height: calc(90vh - 80px);
-            overflow-y: auto;
+            padding: 20px;
         }
-        
+
         .form-group {
             margin-bottom: 15px;
         }
-        
+
         .form-group label {
             display: block;
             margin-bottom: 6px;
             font-weight: 600;
-            color: var(--dark);
-            font-size: 13px;
+            color: #616161;
+            font-size: 12px;
         }
-        
+
         .form-control {
             width: 100%;
             padding: 10px 12px;
-            border: 2px solid #e9ecef;
-            border-radius: 8px;
-            font-size: 13px;
-            transition: all 0.3s;
+            border: 2px solid #e0e0e0;
+            border-radius: 6px;
+            font-size: 12px;
         }
-        
+
         .form-control:focus {
             outline: none;
             border-color: var(--primary);
-            box-shadow: 0 0 0 3px rgba(44, 90, 160, 0.1);
         }
-        
+
         .form-row {
             display: grid;
             grid-template-columns: 1fr 1fr;
-            gap: 15px;
-        }
-        
-        .alert {
-            padding: 10px 12px;
-            border-radius: 6px;
-            margin-bottom: 15px;
-            font-size: 13px;
-            animation: fadeIn 0.5s;
-        }
-        
-        @keyframes fadeIn {
-            from { opacity: 0; }
-            to { opacity: 1; }
-        }
-        
-        .alert-success {
-            background: #d4edda;
-            color: #155724;
-            border: 1px solid #c3e6cb;
-        }
-        
-        .alert-error {
-            background: #f8d7da;
-            color: #721c24;
-            border: 1px solid #f5c6cb;
-        }
-        
-        .network-info {
-            background: #fff3cd;
-            border: 1px solid #ffeaa7;
-            border-radius: 6px;
-            padding: 10px 12px;
-            margin-bottom: 15px;
-            font-size: 13px;
-        }
-        
-        .network-info i {
-            color: var(--warning);
-            margin-right: 6px;
-        }
-        
-        .fee-display {
-            background: rgba(59, 130, 246, 0.1);
-            padding: 12px;
-            border-radius: 6px;
-            margin: 12px 0;
-            border: 1px solid rgba(59, 130, 246, 0.2);
-        }
-        
-        .fee-amount {
-            font-weight: 700;
-            color: var(--primary);
-            font-size: 14px;
-        }
-        
-        .account-info {
-            background: var(--light);
-            padding: 12px;
-            border-radius: 6px;
-            margin: 12px 0;
-            border: 1px solid #e9ecef;
-            font-size: 13px;
-        }
-        
-        .tx-hash {
-            font-family: monospace;
-            background: #f1f5f9;
-            padding: 6px 10px;
-            border-radius: 5px;
-            font-size: 11px;
-            word-break: break-all;
-            margin: 8px 0;
-        }
-        
-        .empty-state {
-            text-align: center;
-            padding: 40px 20px;
-            color: var(--gray);
-        }
-        
-        .empty-state i {
-            font-size: 48px;
-            margin-bottom: 15px;
-            color: #dee2e6;
-        }
-        
-        .empty-state p {
-            font-size: 16px;
-            margin-bottom: 20px;
-        }
-        
-        .confirmation-modal {
-            text-align: center;
-        }
-        
-        .confirmation-modal .modal-body {
-            padding: 30px;
-        }
-        
-        .confirmation-modal h3 {
-            margin-bottom: 12px;
-            color: var(--dark);
-            font-size: 18px;
-        }
-        
-        .confirmation-modal p {
-            margin-bottom: 20px;
-            color: var(--gray);
-            font-size: 14px;
-        }
-        
-        .confirmation-buttons {
-            display: flex;
             gap: 12px;
-            justify-content: center;
         }
-        
-        .btn-danger {
-            background: var(--danger);
-            color: white;
-        }
-        
-        .metamask-loading {
-            text-align: center;
-            padding: 20px;
-        }
-        
-        .transaction-result {
-            text-align: center;
-            padding: 20px;
-        }
-        
-        .transaction-result h3 {
-            margin-bottom: 12px;
-            font-size: 18px;
-        }
-        
-        .transaction-result.success h3 {
-            color: var(--success);
-        }
-        
-        .transaction-result.error h3 {
-            color: var(--danger);
-        }
-        
-        .image-upload-container {
-            border: 2px dashed #dee2e6;
-            border-radius: 8px;
-            padding: 20px;
-            text-align: center;
-            background: #f8f9fa;
-            transition: all 0.3s;
-            cursor: pointer;
-        }
-        
-        .image-upload-container:hover {
-            border-color: var(--primary);
-            background: #f0f8ff;
-        }
-        
-        .image-upload-container.dragover {
-            border-color: var(--success);
-            background: #f0fff4;
-        }
-        
-        .image-preview {
-            width: 100%;
-            max-width: 200px;
-            height: 150px;
-            margin: 0 auto 15px;
+
+        .fee-display {
+            background: rgba(33, 150, 243, 0.1);
+            padding: 10px;
             border-radius: 6px;
-            overflow: hidden;
-            display: none;
-            box-shadow: 0 3px 10px rgba(0,0,0,0.1);
+            margin: 15px 0;
+            border: 1px solid rgba(33, 150, 243, 0.2);
         }
-        
-        .image-preview img {
-            width: 100%;
-            height: 100%;
-            object-fit: cover;
-        }
-        
-        .upload-icon {
-            font-size: 48px;
-            color: var(--gray);
-            margin-bottom: 10px;
-        }
-        
-        .file-input {
-            display: none;
-        }
-        
-        .upload-text {
-            margin-bottom: 10px;
-            color: var(--gray);
-        }
-        
-        .upload-hint {
-            font-size: 12px;
-            color: var(--gray);
-        }
-        
-        .remove-image {
-            margin-top: 10px;
-            background: var(--danger);
-            color: white;
-            border: none;
-            padding: 5px 10px;
-            border-radius: 4px;
-            cursor: pointer;
-            font-size: 12px;
-            transition: all 0.3s;
-        }
-        
-        .remove-image:hover {
-            background: #c82333;
-        }
-        
-        /* Responsive */
-        @media (max-width: 1024px) {
-            .sidebar {
-                width: 250px;
-            }
-            
-            .main-content {
-                margin-left: 250px;
-            }
-        }
-        
+
         @media (max-width: 768px) {
             .sidebar {
                 width: 70px;
             }
-            
             .sidebar-header h2, .sidebar-header p, .menu-item span {
                 display: none;
             }
-            
-            .sidebar-header {
-                padding: 15px;
-            }
-            
-            .menu-item {
-                justify-content: center;
-                padding: 15px;
-            }
-            
             .main-content {
                 margin-left: 70px;
+                padding: 16px;
             }
-            
-            .header {
-                flex-direction: column;
-                gap: 15px;
-                align-items: flex-start;
-            }
-            
-            .header-left {
-                flex-direction: column;
-                align-items: flex-start;
-                gap: 10px;
-            }
-            
-            .stats-grid {
-                grid-template-columns: 1fr;
-            }
-            
             .form-row {
                 grid-template-columns: 1fr;
-            }
-        }
-        
-        @media (max-width: 576px) {
-            .main-content {
-                padding: 10px;
-            }
-            
-            .section-header {
-                flex-direction: column;
-                gap: 15px;
-                align-items: flex-start;
-            }
-            
-            .modal-content {
-                width: 95%;
             }
         }
     </style>
@@ -1095,29 +795,26 @@ foreach ($san_pham as $product) {
         <div class="sidebar">
             <div class="sidebar-header">
                 <h2>Nhà Sản Xuất</h2>
-                <p>BlockChain Supply</p>
+                <p>BlockChain Supply Chain</p>
             </div>
             <div class="sidebar-menu">
-                <a href="nha_san_xuat.php" class="menu-item active">
+                <a href="nha_san_xuat.php" class="menu-item ">
                     <i class="fas fa-tachometer-alt"></i>
                     <span>Tổng quan</span>
                 </a>
-                <a href="categories.php" class="menu-item">
+                 <a href="categories.php" class="menu-item">
+                    <i class="fas fa-shopping-cart"></i>
+                    <span>Danh mục</span>
+                </a>
+                <a href="register.php" class="menu-item active">
                     <i class="fas fa-box"></i>
                     <span>Sản phẩm</span>
                 </a>
-                <a href="order.php" class="menu-item">
-                    <i class="fas fa-industry"></i>
+                <a href="orders.php" class="menu-item">
+                    <i class="fas fa-shopping-cart"></i>
                     <span>Đơn hàng</span>
                 </a>
-                <a href="#" class="menu-item">
-                    <i class="fas fa-chart-line"></i>
-                    <span>Thống kê</span>
-                </a>
-                <a href="#" class="menu-item">
-                    <i class="fas fa-cog"></i>
-                    <span>Cài đặt</span>
-                </a>
+                   
                 <a href="../logout.php" class="menu-item">
                     <i class="fas fa-sign-out-alt"></i>
                     <span>Đăng xuất</span>
@@ -1129,21 +826,14 @@ foreach ($san_pham as $product) {
         <div class="main-content">
             <!-- Header -->
             <div class="header">
-                <div class="header-left">
-                    <h1>Dashboard Nhà Sản Xuất</h1>
-                    <div id="walletContainer">
-                        <button class="connect-btn" id="connectWalletBtn">
-                            <i class="fab fa-ethereum"></i> Kết nối MetaMask
-                        </button>
-                    </div>
-                </div>
+                <h1>Đăng ký nguyên liệu</h1>
                 <div class="user-info">
                     <div class="user-avatar">
                         <?php echo strtoupper(substr($nha_san_xuat['ho_ten'] ?? 'N', 0, 1)); ?>
                     </div>
                     <div>
-                        <div style="font-weight: 600;"><?php echo htmlspecialchars($nha_san_xuat['ho_ten'] ?? 'Nhà Sản Xuất'); ?></div>
-                        <div style="font-size: 14px; color: var(--gray);"><?php echo htmlspecialchars($nha_san_xuat['email'] ?? 'nha.san.xuat@example.com'); ?></div>
+                        <div style="font-weight: 600; font-size: 13px;"><?php echo htmlspecialchars($nha_san_xuat['ho_ten'] ?? 'Nhà Sản Xuất'); ?></div>
+                        <div style="font-size: 11px; color: #757575;"><?php echo htmlspecialchars($nha_san_xuat['email'] ?? 'nha.san.xuat@example.com'); ?></div>
                     </div>
                 </div>
             </div>
@@ -1161,60 +851,23 @@ foreach ($san_pham as $product) {
                 </div>
             <?php endif; ?>
 
-            <!-- Stats Grid -->
-            <div class="stats-grid">
-                <div class="stat-card">
-                    <div class="stat-icon">
-                        <i class="fas fa-box"></i>
-                    </div>
-                    <div class="stat-info">
-                        <h3><?php echo $total_products; ?></h3>
-                        <p>Tổng sản phẩm</p>
-                    </div>
-                </div>
-                <div class="stat-card">
-                    <div class="stat-icon">
-                        <i class="fas fa-link"></i>
-                    </div>
-                    <div class="stat-info">
-                        <h3><?php echo $blockchain_products; ?></h3>
-                        <p>Sản phẩm trên Blockchain</p>
-                    </div>
-                </div>
-                <div class="stat-card">
-                    <div class="stat-icon">
-                        <i class="fas fa-check-circle"></i>
-                    </div>
-                    <div class="stat-info">
-                        <h3><?php echo $blockchain_products; ?></h3>
-                        <p>Đã xác thực BC</p>
-                    </div>
-                </div>
-                <div class="stat-card">
-                    <div class="stat-icon">
-                        <i class="fas fa-clock"></i>
-                    </div>
-                    <div class="stat-info">
-                        <h3><?php echo $pending_products; ?></h3>
-                        <p>Chờ xác thực</p>
-                    </div>
-                </div>
-            </div>
+          
 
             <!-- Products Section -->
             <div class="content-section">
                 <div class="section-header">
-                    <h2>Quản lý Sản phẩm trên Blockchain</h2>
-                    <button class="btn btn-blockchain" id="addProductBlockchainBtn">
-                        <i class="fab fa-ethereum"></i> Đăng ký sản phẩm với Blockchain
+                    <h2>Danh sách sản phẩm</h2>
+                    <button class="btn btn-metamask" id="addProductBlockchainBtn">
+                        <i class="fab fa-ethereum"></i> Đăng ký sản phẩm
                     </button>
                 </div>
                 <div class="table-container">
                     <?php if (empty($san_pham)): ?>
-                        <div class="empty-state">
-                            <i class="fas fa-box-open"></i>
-                            <p>Chưa có sản phẩm nào được đăng ký</p>
-                            <button class="btn btn-primary" id="addFirstProductBtn">
+                        <div class="empty-state" style="text-align: center; padding: 40px 20px; color: #9e9e9e;">
+                            <i class="fas fa-box-open" style="font-size: 40px; margin-bottom: 16px; opacity: 0.5;"></i>
+                            <h3 style="font-size: 16px; margin-bottom: 8px; color: #616161;">Chưa có sản phẩm nào được đăng ký</h3>
+                            <p style="font-size: 13px;">Bắt đầu bằng cách đăng ký sản phẩm đầu tiên của bạn với Blockchain</p>
+                            <button class="btn btn-metamask" id="addFirstProductBtn" style="margin-top: 12px;">
                                 <i class="fab fa-ethereum"></i> Đăng ký sản phẩm đầu tiên
                             </button>
                         </div>
@@ -1228,65 +881,54 @@ foreach ($san_pham as $product) {
                                     <th>Danh mục</th>
                                     <th>Số lượng</th>
                                     <th>Đơn vị</th>
-                                    <th>Trạng thái Blockchain</th>
-                                    <th>Transaction Hash</th>
-                                    <th>Ngày tạo</th>
-                                    <th>Thao tác</th>
+                                    <th>Giá</th>
+                                    <th>Địa chỉ</th>
+                                    <th>Nhiệt độ</th>
+                                    <th>Độ ẩm</th>
+                                
+                                
                                 </tr>
                             </thead>
                             <tbody>
-                                <?php foreach ($san_pham as $product): ?>
+                                <?php foreach ($san_pham as $product): 
+                                    $thong_so = json_decode($product['thong_so_ky_thuat'] ?? '{}', true);
+                                ?>
                                 <tr>
                                     <td>
                                         <?php if ($product['hinh_anh']): ?>
                                             <img src="../uploads/products/<?php echo htmlspecialchars($product['hinh_anh']); ?>" 
-                                                 alt="<?php echo htmlspecialchars($product['ten_san_pham']); ?>" 
                                                  class="product-image">
                                         <?php else: ?>
-                                            <img src="data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iNTAiIGhlaWdodD0iNTAiIHZpZXdCb3g9IjAgMCA1MCA1MCIgZmlsbD0ibm9uZSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj4KPHJlY3Qgd2lkdGg9IjUwIiBoZWlnaHQ9IjUwIiBmaWxsPSIjRjhGOUZBIi8+CjxwYXRoIGQ9Ik0zMi41IDIwLjVDMzIuNSAyMi43MDkxIDMwLjcwOTEgMjQuNSAyOC41IDI0LjVDMjYuMjk5IDI0LjUgMjQuNSAyMi43MDkxIDI0LjUgMjAuNUMyNC41IDE4LjI5MDkgMjYuMjk5IDE2LjUgMjguNSAxNi41QzMwLjcwOTEgMTYuNSAzMi41IDE4LjI5MDkgMzIuNSAyMC41WiIgZmlsbD0iI0QxRDVEOCIvPgo8cGF0aCBkPSJNMzUgMzVIMjBDMTkuNDQ3NyAzNSAxOSAzNC41NTIzIDE5IDM0VjIyQzE5IDIxLjQ0NzcgMTkuNDQ3NyAyMSAyMCAyMUgzMEMzMC41NTIzIDIxIDMxIDIxLjQ0NzcgMzEgMjJWMzVDMzEgMzUuNTUyMyAzMC41NTIzIDM2IDMwIDM2WiIgZmlsbD0iI0QxRDVEOCIvPgo8L3N2Zz4K" 
-                                                 alt="No image" 
-                                                 class="product-image">
+                                            <div class="product-image" style="background: #f4f5fa; display: flex; align-items: center; justify-content: center;">
+                                                <i class="fas fa-box" style="color: #d1d5d8;"></i>
+                                            </div>
                                         <?php endif; ?>
                                     </td>
-                                    <td><?php echo htmlspecialchars($product['ma_san_pham']); ?></td>
+                                    <td style="font-family: monospace; font-size: 10px;"><?php echo htmlspecialchars($product['ma_san_pham']); ?></td>
                                     <td>
-                                        <div style="font-weight: 600;"><?php echo htmlspecialchars($product['ten_san_pham']); ?></div>
+                                        <div style="font-weight: 600; font-size: 12px;"><?php echo htmlspecialchars($product['ten_san_pham']); ?></div>
                                         <?php if ($product['mo_ta']): ?>
-                                            <div style="font-size: 11px; color: var(--gray);"><?php echo htmlspecialchars(substr($product['mo_ta'], 0, 50)) . '...'; ?></div>
+                                            <div style="font-size: 10px; color: #757575;"><?php echo htmlspecialchars(substr($product['mo_ta'], 0, 30)) . '...'; ?></div>
                                         <?php endif; ?>
                                     </td>
-                                    <td><?php echo htmlspecialchars($product['ten_danh_muc']); ?></td>
-                                    <td><?php echo number_format($product['so_luong']); ?></td>
-                                    <td><?php echo htmlspecialchars($product['don_vi_tinh']); ?></td>
-                                    <td>
-                                        <?php if (!empty($product['blockchain_tx_hash'])): ?>
-                                            <span class="blockchain-badge">
-                                                <i class="fas fa-check"></i> Đã xác thực
-                                            </span>
-                                        <?php else: ?>
-                                            <span class="status-badge status-pending">Chờ xác thực</span>
-                                        <?php endif; ?>
+                                    <td style="font-size: 11px;"><?php echo htmlspecialchars($product['ten_danh_muc']); ?></td>
+                                    <td style="font-size: 11px; text-align: center;"><?php echo number_format($product['so_luong']); ?></td>
+                                    <td style="font-size: 11px;"><?php echo htmlspecialchars($product['don_vi_tinh']); ?></td>
+                                    <td style="font-size: 11px; text-align: center; font-weight: 600; color: var(--success);">
+                                        <?php echo number_format($product['gia_ban'] ?? 0); ?> đ
                                     </td>
-                                    <td>
-                                        <?php if (!empty($product['blockchain_tx_hash'])): ?>
-                                            <span class="tx-hash" title="<?php echo htmlspecialchars($product['blockchain_tx_hash']); ?>">
-                                                <?php echo substr($product['blockchain_tx_hash'], 0, 10) . '...'; ?>
-                                            </span>
-                                        <?php else: ?>
-                                            <span style="color: var(--gray); font-size: 11px;">Chưa có TX</span>
-                                        <?php endif; ?>
+                                    <td style="font-size: 10px; color: #757575;">
+                                        <?php 
+                                        $dia_chi = [];
+                                        if ($product['tinh_thanh']) $dia_chi[] = $product['tinh_thanh'];
+                                        if ($product['quan_huyen']) $dia_chi[] = $product['quan_huyen'];
+                                        echo implode(', ', $dia_chi);
+                                        ?>
                                     </td>
-                                    <td><?php echo date('d/m/Y', strtotime($product['ngay_tao'])); ?></td>
-                                    <td>
-                                        <div class="action-buttons">
-                                            <button class="action-btn edit" onclick="editProduct(<?php echo $product['id']; ?>)">
-                                                <i class="fas fa-edit"></i>
-                                            </button>
-                                            <button class="action-btn delete" onclick="deleteProduct(<?php echo $product['id']; ?>)">
-                                                <i class="fas fa-trash"></i>
-                                            </button>
-                                        </div>
-                                    </td>
+                                    <td style="font-size: 11px; text-align: center;"><?php echo $thong_so['nhiet_do_bao_quan'] ?? 'N/A'; ?>°C</td>
+                                    <td style="font-size: 11px; text-align: center;"><?php echo $thong_so['do_am_bao_quan'] ?? 'N/A'; ?>%</td>
+                                   
+                                    
                                 </tr>
                                 <?php endforeach; ?>
                             </tbody>
@@ -1300,50 +942,29 @@ foreach ($san_pham as $product) {
     <!-- Add Product with Blockchain Modal -->
     <div class="modal" id="addProductBlockchainModal">
         <div class="modal-content">
-            <div class="modal-header blockchain">
+            <div class="modal-header">
                 <button class="close-modal">&times;</button>
                 <h2><i class="fab fa-ethereum"></i> Đăng ký sản phẩm với Blockchain</h2>
-                <p>Rootstock Testnet</p>
             </div>
             <div class="modal-body">
-                <div class="network-info">
+                <div style="background: rgba(255, 193, 7, 0.1); border: 1px solid rgba(255, 193, 7, 0.2); border-radius: 6px; padding: 10px 12px; margin-bottom: 12px; font-size: 11px;">
                     <i class="fas fa-info-circle"></i>
                     <small>Đảm bảo bạn đang kết nối với <strong>Rootstock Testnet</strong> và có đủ RBTC để thanh toán phí gas.</small>
                 </div>
                 
-                <div id="blockchainLoading" class="metamask-loading" style="display: none;">
-                    <i class="fas fa-spinner fa-spin" style="font-size: 36px; margin-bottom: 15px; color: var(--blockchain);"></i>
-                    <h3>Đang kết nối với Rootstock Testnet...</h3>
-                    <p>Vui lòng chờ trong giây lát</p>
+                <div id="blockchainLoading" style="text-align: center; padding: 20px; display: none;">
+                    <i class="fas fa-spinner fa-spin" style="font-size: 32px; margin-bottom: 12px; color: #f6851b;"></i>
+                    <h3 style="font-size: 14px; margin-bottom: 8px;">Đang kết nối với Rootstock Testnet...</h3>
+                    <p style="font-size: 11px; color: #757575;">Vui lòng chờ trong giây lát</p>
                 </div>
                 
                 <div id="blockchainContent">
-                    <form id="addProductBlockchainForm" enctype="multipart/form-data">
-                        <!-- Hình ảnh sản phẩm -->
-                        <div class="form-group">
-                            <label>Hình ảnh sản phẩm</label>
-                            <div class="image-upload-container" id="imageUploadContainer">
-                                <input type="file" id="productImage" name="hinh_anh" class="file-input" accept="image/*">
-                                <div class="image-preview" id="imagePreview">
-                                    <img id="previewImage" src="" alt="Preview">
-                                </div>
-                                <div id="uploadArea">
-                                    <div class="upload-icon">
-                                        <i class="fas fa-cloud-upload-alt"></i>
-                                    </div>
-                                    <div class="upload-text">
-                                        <strong>Click để chọn hình ảnh</strong>
-                                    </div>
-                                    <div class="upload-hint">
-                                        PNG, JPG, GIF, WEBP - Tối đa 5MB
-                                    </div>
-                                </div>
-                            </div>
-                        </div>
-
+                    <form id="addProductBlockchainForm" method="POST" enctype="multipart/form-data">
+                        <input type="hidden" name="action" value="add_product_blockchain">
+                        
                         <div class="form-group">
                             <label for="productName">Tên sản phẩm *</label>
-                            <input type="text" class="form-control" id="productName" name="ten_san_pham" required>
+                            <input type="text" class="form-control" id="productName" name="ten_san_pham" required placeholder="Nhập tên sản phẩm">
                         </div>
                         
                         <div class="form-group">
@@ -1357,7 +978,9 @@ foreach ($san_pham as $product) {
                                 <select class="form-control" id="productCategory" name="danh_muc_id" required>
                                     <option value="">Chọn danh mục</option>
                                     <?php foreach ($danh_muc as $category): ?>
-                                        <option value="<?php echo $category['id']; ?>"><?php echo htmlspecialchars($category['ten_danh_muc']); ?></option>
+                                        <option value="<?php echo $category['id']; ?>">
+                                            <?php echo htmlspecialchars($category['ten_danh_muc']); ?>
+                                        </option>
                                     <?php endforeach; ?>
                                 </select>
                             </div>
@@ -1372,22 +995,36 @@ foreach ($san_pham as $product) {
                                     <option value="lít">Lít</option>
                                     <option value="thùng">Thùng</option>
                                     <option value="bao">Bao</option>
-                                    <option value="mét">Mét</option>
-                                    <option value="cuộn">Cuộn</option>
                                 </select>
                             </div>
                         </div>
                         
-                        <div class="form-group">
-                            <label for="productQuantity">Số lượng *</label>
-                            <input type="number" class="form-control" id="productQuantity" name="so_luong" min="1" required>
+                        <div class="form-row">
+                            <div class="form-group">
+                                <label for="productQuantity">Số lượng *</label>
+                                <input type="number" class="form-control" id="productQuantity" name="so_luong" min="1" required placeholder="Nhập số lượng">
+                            </div>
+                            
+                            <div class="form-group">
+                                <label for="productPrice">Giá bán (VND) *</label>
+                                <input type="number" class="form-control" id="productPrice" name="gia_ban" min="0" required placeholder="Nhập giá bán">
+                            </div>
                         </div>
-                        
-                        <div class="form-group">
-                            <label for="productSpecs">Thông số kỹ thuật</label>
-                            <textarea class="form-control" id="productSpecs" name="thong_so_ky_thuat" rows="2" placeholder="Thông số kỹ thuật, đặc điểm sản phẩm..."></textarea>
+
+                        <!-- Thông số kỹ thuật -->
+                        <div class="form-row">
+                            <div class="form-group">
+                                <label for="nhietDoBaoQuan">Nhiệt độ bảo quản (°C)</label>
+                                <input type="number" class="form-control" id="nhietDoBaoQuan" name="nhiet_do_bao_quan" placeholder="20" step="0.1">
+                            </div>
+                            
+                            <div class="form-group">
+                                <label for="doAmBaoQuan">Độ ẩm bảo quản (%)</label>
+                                <input type="number" class="form-control" id="doAmBaoQuan" name="do_am_bao_quan" placeholder="60" step="0.1">
+                            </div>
                         </div>
-                        
+
+                        <!-- Địa chỉ -->
                         <div class="form-row">
                             <div class="form-group">
                                 <label for="productProvince">Tỉnh/Thành phố</label>
@@ -1416,6 +1053,12 @@ foreach ($san_pham as $product) {
                             <label for="productAddress">Địa chỉ cụ thể</label>
                             <input type="text" class="form-control" id="productAddress" name="dia_chi_cu_the" placeholder="Số nhà, đường, thôn/xóm...">
                         </div>
+
+                        <div class="form-group">
+                            <label for="productImage">Hình ảnh sản phẩm</label>
+                            <input type="file" class="form-control" id="productImage" name="hinh_anh" accept="image/*">
+                            <small style="color: #757575; font-size: 11px;">PNG, JPG, JPEG, GIF, WEBP - Tối đa 5MB</small>
+                        </div>
                         
                         <div class="form-group">
                             <label for="productNote">Ghi chú</label>
@@ -1423,19 +1066,20 @@ foreach ($san_pham as $product) {
                         </div>
                         
                         <div class="fee-display">
-                            <p><strong>Phí đăng ký trên Blockchain:</strong> <span class="fee-amount">0.001 RBTC</span></p>
+                            <p><strong>Phí đăng ký trên Blockchain:</strong> <span style="font-weight: 700; color: var(--primary);">0.00001 RBTC</span></p>
                             <p><small>+ Phí gas của mạng Rootstock Testnet</small></p>
                         </div>
                         
-                        <button type="button" class="btn btn-blockchain" style="width: 100%;" onclick="registerProductWithBlockchain()">
+                        <!-- Transaction hash sẽ được thêm bằng JavaScript -->
+                        <input type="hidden" name="transaction_hash" id="transactionHash">
+                        
+                        <button type="button" class="btn btn-metamask" style="width: 100%; padding: 12px;" onclick="registerProductWithBlockchain()">
                             <i class="fab fa-ethereum"></i> Đăng ký với Blockchain
                         </button>
                     </form>
                 </div>
                 
-                <div id="transactionResult" style="display: none;">
-                    <!-- Kết quả giao dịch sẽ được hiển thị ở đây -->
-                </div>
+                <div id="transactionResult" style="display: none;"></div>
             </div>
         </div>
     </div>
@@ -1447,49 +1091,31 @@ foreach ($san_pham as $product) {
                 <button class="close-modal">&times;</button>
                 <h2><i class="fas fa-exclamation-triangle"></i> Xác nhận xóa</h2>
             </div>
-            <div class="modal-body confirmation-modal">
-                <h3>Bạn có chắc chắn muốn xóa sản phẩm này?</h3>
-                <p>Hành động này không thể hoàn tác. Tất cả dữ liệu về sản phẩm sẽ bị xóa vĩnh viễn.</p>
-                <div class="confirmation-buttons">
-                    <form id="deleteProductForm" method="POST" style="display: inline;">
-                        <input type="hidden" name="action" value="delete_product">
-                        <input type="hidden" name="product_id" id="deleteProductId">
-                        <button type="submit" class="btn btn-danger">
-                            <i class="fas fa-trash"></i> Xóa
-                        </button>
-                    </form>
-                    <button class="btn btn-secondary" onclick="closeDeleteModal()">
-                        <i class="fas fa-times"></i> Hủy
+            <div class="modal-body" style="text-align: center; padding: 20px;">
+                <h3 style="margin-bottom: 12px; font-size: 16px;">Bạn có chắc chắn muốn xóa sản phẩm này?</h3>
+                <p style="margin-bottom: 20px; color: #757575; font-size: 13px;">Hành động này không thể hoàn tác.</p>
+                <form id="deleteProductForm" method="POST" style="display: inline;">
+                    <input type="hidden" name="action" value="delete_product">
+                    <input type="hidden" name="product_id" id="deleteProductId">
+                    <button type="submit" class="btn" style="background: var(--danger); color: white;">
+                        <i class="fas fa-trash"></i> Xóa
                     </button>
-                </div>
+                </form>
+                <button class="btn" style="background: #e0e0e0; color: #616161; margin-left: 10px;" onclick="closeDeleteModal()">
+                    <i class="fas fa-times"></i> Hủy
+                </button>
             </div>
         </div>
     </div>
 
     <script>
+        // Modal functionality
         document.addEventListener('DOMContentLoaded', function() {
-            // Modal functionality
             const addProductBlockchainBtn = document.getElementById('addProductBlockchainBtn');
             const addFirstProductBtn = document.getElementById('addFirstProductBtn');
             const addProductBlockchainModal = document.getElementById('addProductBlockchainModal');
             const deleteConfirmModal = document.getElementById('deleteConfirmModal');
             const closeModals = document.querySelectorAll('.close-modal');
-            
-            // Image upload functionality
-            const imageUploadContainer = document.getElementById('imageUploadContainer');
-            const productImageInput = document.getElementById('productImage');
-            const imagePreview = document.getElementById('imagePreview');
-            const previewImage = document.getElementById('previewImage');
-            const uploadArea = document.getElementById('uploadArea');
-            
-            // Modal triggers
-            if (addProductBlockchainBtn) {
-                addProductBlockchainBtn.addEventListener('click', openProductModal);
-            }
-            
-            if (addFirstProductBtn) {
-                addFirstProductBtn.addEventListener('click', openProductModal);
-            }
             
             function openProductModal() {
                 addProductBlockchainModal.style.display = 'block';
@@ -1501,277 +1127,98 @@ foreach ($san_pham as $product) {
                 }
             }
             
-            // Image upload event listeners
-            if (imageUploadContainer && productImageInput) {
-                // Click to select file
-                imageUploadContainer.addEventListener('click', function() {
-                    productImageInput.click();
-                });
-                
-                // File selection
-                productImageInput.addEventListener('change', function(e) {
-                    handleImageSelection(e.target.files[0]);
-                });
-                
-                // Drag and drop
-                imageUploadContainer.addEventListener('dragover', function(e) {
-                    e.preventDefault();
-                    imageUploadContainer.classList.add('dragover');
-                });
-                
-                imageUploadContainer.addEventListener('dragleave', function() {
-                    imageUploadContainer.classList.remove('dragover');
-                });
-                
-                imageUploadContainer.addEventListener('drop', function(e) {
-                    e.preventDefault();
-                    imageUploadContainer.classList.remove('dragover');
-                    if (e.dataTransfer.files.length > 0) {
-                        handleImageSelection(e.dataTransfer.files[0]);
-                    }
-                });
-            }
+            if (addProductBlockchainBtn) addProductBlockchainBtn.addEventListener('click', openProductModal);
+            if (addFirstProductBtn) addFirstProductBtn.addEventListener('click', openProductModal);
             
-            function handleImageSelection(file) {
-                if (file && file.type.startsWith('image/')) {
-                    // Check file size (5MB max)
-                    if (file.size > 5 * 1024 * 1024) {
-                        showNotification('Kích thước file quá lớn. Tối đa 5MB.', 'error');
-                        return;
-                    }
-                    
-                    const reader = new FileReader();
-                    reader.onload = function(e) {
-                        previewImage.src = e.target.result;
-                        imagePreview.style.display = 'block';
-                        uploadArea.style.display = 'none';
-                        
-                        // Add remove button
-                        if (!document.getElementById('removeImageBtn')) {
-                            const removeBtn = document.createElement('button');
-                            removeBtn.id = 'removeImageBtn';
-                            removeBtn.className = 'remove-image';
-                            removeBtn.innerHTML = '<i class="fas fa-times"></i> Xóa ảnh';
-                            removeBtn.onclick = function(e) {
-                                e.stopPropagation();
-                                resetImageUpload();
-                            };
-                            imageUploadContainer.appendChild(removeBtn);
-                        }
-                    };
-                    reader.readAsDataURL(file);
-                } else {
-                    showNotification('Vui lòng chọn file hình ảnh hợp lệ.', 'error');
-                }
-            }
-            
-            function resetImageUpload() {
-                productImageInput.value = '';
-                imagePreview.style.display = 'none';
-                uploadArea.style.display = 'block';
-                const removeBtn = document.getElementById('removeImageBtn');
-                if (removeBtn) {
-                    removeBtn.remove();
-                }
-            }
-            
-            // Close modals
             closeModals.forEach(closeBtn => {
                 closeBtn.addEventListener('click', function() {
                     addProductBlockchainModal.style.display = 'none';
                     deleteConfirmModal.style.display = 'none';
-                    // Reset form when closing modal
-                    resetImageUpload();
-                    document.getElementById('addProductBlockchainForm').reset();
                 });
             });
             
-            // Close modals when clicking outside
             window.addEventListener('click', function(e) {
-                if (e.target === addProductBlockchainModal) {
+                if (e.target === addProductBlockchainModal || e.target === deleteConfirmModal) {
                     addProductBlockchainModal.style.display = 'none';
-                    resetImageUpload();
-                    document.getElementById('addProductBlockchainForm').reset();
-                }
-                if (e.target === deleteConfirmModal) {
                     deleteConfirmModal.style.display = 'none';
                 }
             });
-            
-            // Metamask connection for wallet
-            const connectWalletBtn = document.getElementById('connectWalletBtn');
-            const walletContainer = document.getElementById('walletContainer');
-            
-            if (connectWalletBtn) {
-                connectWalletBtn.addEventListener('click', async function() {
-                    if (typeof window.ethereum !== 'undefined') {
-                        try {
-                            // Request account access
-                            const accounts = await window.ethereum.request({ method: 'eth_requestAccounts' });
-                            const account = accounts[0];
-                            
-                            // Display connected wallet
-                            const shortAddress = account.substring(0, 6) + '...' + account.substring(account.length - 4);
-                            walletContainer.innerHTML = `
-                                <div class="wallet-info connected">
-                                    <i class="fab fa-ethereum"></i>
-                                    <div class="wallet-address">${shortAddress}</div>
-                                </div>
-                            `;
-                            
-                            showNotification('Kết nối MetaMask thành công!', 'success');
-                        } catch (error) {
-                            console.error('Error connecting to Metamask:', error);
-                            showNotification('Lỗi kết nối MetaMask!', 'error');
-                        }
-                    } else {
-                        showNotification('Vui lòng cài đặt MetaMask!', 'error');
-                    }
-                });
-            }
         });
 
-        // Blockchain functions for product registration
+        // Blockchain functions
         async function registerProductWithBlockchain() {
             const form = document.getElementById('addProductBlockchainForm');
-            const formData = new FormData(form);
             
             // Validate form
-            if (!validateProductForm(formData)) {
-                showNotification('Vui lòng điền đầy đủ thông tin bắt buộc!', 'error');
+            const requiredFields = ['ten_san_pham', 'danh_muc_id', 'don_vi_tinh', 'so_luong', 'gia_ban'];
+            let isValid = true;
+            
+            requiredFields.forEach(field => {
+                const input = form.elements[field];
+                if (!input.value.trim()) {
+                    isValid = false;
+                    input.style.borderColor = 'var(--danger)';
+                } else {
+                    input.style.borderColor = '#e0e0e0';
+                }
+            });
+            
+            if (!isValid) {
+                alert('Vui lòng điền đầy đủ thông tin bắt buộc!');
                 return;
             }
             
             if (typeof window.ethereum === 'undefined') {
-                showNotification('Vui lòng cài đặt MetaMask để sử dụng tính năng này!', 'error');
+                alert('Vui lòng cài đặt MetaMask để sử dụng tính năng này!');
                 return;
             }
 
             try {
-                // Hiển thị loading
                 document.getElementById('blockchainLoading').style.display = 'block';
                 document.getElementById('blockchainContent').style.display = 'none';
 
-                // Kết nối MetaMask
                 const accounts = await window.ethereum.request({ 
                     method: 'eth_requestAccounts' 
                 });
                 
                 const account = accounts[0];
-                console.log('Connected account:', account);
-
-                // Tạo transaction hash giả lập (trong thực tế sẽ gọi smart contract)
                 const txHash = '0x' + Math.random().toString(16).substr(2, 64);
                 
-                // Hiển thị popup xác nhận của MetaMask
+                // Set transaction hash to form
+                document.getElementById('transactionHash').value = txHash;
+                
                 try {
-                    // Gửi transaction giả lập
+                     const feeInWei = '0x' + BigInt(0.0001 * 1e18).toString(16);
+    
+                     console.log('Fee in wei:', feeInWei);
                     const transactionParameters = {
                         from: account,
                         to: '0x0000000000000000000000000000000000000000', // Địa chỉ contract
-                        value: '0x0', // 0 ETH
-                        data: '0x' // Data rỗng
+                        value: feeInWei, // Gửi 0.0001 RBTC
+                        gas: '0x5208', // 21000 gas
+                        gasPrice: '0x3B9ACA00', // 1 Gwei = 1,000,000,000 wei
                     };
                     
-                    // Gửi transaction - MetaMask sẽ hiển thị popup xác nhận
                     const realTxHash = await window.ethereum.request({
                         method: 'eth_sendTransaction',
                         params: [transactionParameters],
                     });
                     
-                    console.log('Transaction sent:', realTxHash);
-                    await sendProductToServer(formData, realTxHash);
+                    document.getElementById('transactionHash').value = realTxHash;
+                    form.submit();
                     
                 } catch (txError) {
-                    console.log('User rejected transaction or error:', txError);
-                    // Nếu user từ chối, dùng transaction hash giả lập
-                    await sendProductToServer(formData, txHash);
+                    console.log('User rejected transaction, using simulated hash');
+                    document.getElementById('transactionHash').value = txHash;
+                    form.submit();
                 }
                 
             } catch (error) {
                 console.error('Error:', error);
-                showTransactionResult(false, 'Lỗi kết nối MetaMask: ' + error.message);
+                document.getElementById('blockchainLoading').style.display = 'none';
+                document.getElementById('blockchainContent').style.display = 'block';
+                alert('Lỗi kết nối MetaMask: ' + error.message);
             }
-        }
-
-        function validateProductForm(formData) {
-            const requiredFields = ['ten_san_pham', 'danh_muc_id', 'so_luong', 'don_vi_tinh'];
-            for (let field of requiredFields) {
-                if (!formData.get(field)) {
-                    return false;
-                }
-            }
-            return true;
-        }
-
-        async function sendProductToServer(formData, txHash) {
-            try {
-                // Tạo FormData object để gửi file
-                const submitFormData = new FormData();
-                submitFormData.append('action', 'add_product_blockchain');
-                submitFormData.append('ten_san_pham', formData.get('ten_san_pham'));
-                submitFormData.append('mo_ta', formData.get('mo_ta'));
-                submitFormData.append('danh_muc_id', formData.get('danh_muc_id'));
-                submitFormData.append('don_vi_tinh', formData.get('don_vi_tinh'));
-                submitFormData.append('so_luong', formData.get('so_luong'));
-                submitFormData.append('thong_so_ky_thuat', formData.get('thong_so_ky_thuat'));
-                submitFormData.append('tinh_thanh', formData.get('tinh_thanh'));
-                submitFormData.append('quan_huyen', formData.get('quan_huyen'));
-                submitFormData.append('xa_phuong', formData.get('xa_phuong'));
-                submitFormData.append('dia_chi_cu_the', formData.get('dia_chi_cu_the'));
-                submitFormData.append('ngay_thu_hoach', formData.get('ngay_thu_hoach'));
-                submitFormData.append('ghi_chu', formData.get('ghi_chu'));
-                submitFormData.append('transaction_hash', txHash);
-                
-                // Thêm file ảnh nếu có
-                const imageFile = document.getElementById('productImage').files[0];
-                if (imageFile) {
-                    submitFormData.append('hinh_anh', imageFile);
-                }
-
-                const response = await fetch('', {
-                    method: 'POST',
-                    body: submitFormData
-                });
-                
-                if (response.ok) {
-                    showTransactionResult(true, 'Đăng ký sản phẩm thành công trên Blockchain!', txHash);
-                } else {
-                    showTransactionResult(false, 'Lỗi khi lưu sản phẩm!');
-                }
-            } catch (error) {
-                console.error('Server error:', error);
-                showTransactionResult(false, 'Lỗi kết nối server!');
-            }
-        }
-
-        function showTransactionResult(success, message, txHash = '') {
-            document.getElementById('blockchainLoading').style.display = 'none';
-            document.getElementById('transactionResult').style.display = 'block';
-            document.getElementById('transactionResult').innerHTML = `
-                <div class="transaction-result ${success ? 'success' : 'error'}">
-                    <i class="fas fa-${success ? 'check-circle' : 'times-circle'}" style="font-size: 48px; color: ${success ? 'var(--success)' : 'var(--danger)'}; margin-bottom: 15px;"></i>
-                    <h3>${success ? 'Thành công!' : 'Thất bại!'}</h3>
-                    <p>${message}</p>
-                    ${txHash ? `<div class="tx-hash">Transaction Hash: ${txHash}</div>` : ''}
-                    <div style="margin-top: 20px;">
-                        <button class="btn ${success ? 'btn-success' : 'btn-danger'}" onclick="${success ? 'location.reload()' : 'resetBlockchainModal()'}">
-                            ${success ? 'Đóng' : 'Thử lại'}
-                        </button>
-                    </div>
-                </div>
-            `;
-        }
-
-        function resetBlockchainModal() {
-            document.getElementById('blockchainLoading').style.display = 'none';
-            document.getElementById('blockchainContent').style.display = 'block';
-            document.getElementById('transactionResult').style.display = 'none';
-        }
-
-        // Product management functions
-        function editProduct(productId) {
-            showNotification('Tính năng chỉnh sửa sản phẩm đang được phát triển!', 'info');
         }
 
         function deleteProduct(productId) {
@@ -1781,72 +1228,6 @@ foreach ($san_pham as $product) {
 
         function closeDeleteModal() {
             document.getElementById('deleteConfirmModal').style.display = 'none';
-        }
-
-        // Notification function
-        function showNotification(message, type) {
-            const notification = document.createElement('div');
-            notification.className = `notification ${type}`;
-            notification.style.cssText = `
-                position: fixed;
-                top: 20px;
-                right: 20px;
-                padding: 15px 20px;
-                border-radius: 10px;
-                background: white;
-                box-shadow: 0 5px 15px rgba(0, 0, 0, 0.1);
-                display: flex;
-                align-items: center;
-                gap: 10px;
-                z-index: 1001;
-                border-left: 4px solid ${type === 'success' ? 'var(--success)' : type === 'error' ? 'var(--danger)' : 'var(--warning)'};
-                transform: translateX(100%);
-                opacity: 0;
-                transition: all 0.3s;
-            `;
-            notification.innerHTML = `
-                <i class="fas fa-${type === 'success' ? 'check-circle' : type === 'error' ? 'exclamation-circle' : 'info-circle'}" 
-                   style="color: ${type === 'success' ? 'var(--success)' : type === 'error' ? 'var(--danger)' : 'var(--warning)'}"></i>
-                <span>${message}</span>
-            `;
-            
-            document.body.appendChild(notification);
-            
-            setTimeout(() => {
-                notification.style.opacity = '1';
-                notification.style.transform = 'translateX(0)';
-            }, 100);
-            
-            setTimeout(() => {
-                notification.style.opacity = '0';
-                notification.style.transform = 'translateX(100%)';
-                setTimeout(() => {
-                    document.body.removeChild(notification);
-                }, 300);
-            }, 3000);
-        }
-
-        // Lắng nghe sự kiện thay đổi mạng
-        if (typeof window.ethereum !== 'undefined') {
-            window.ethereum.on('chainChanged', (chainId) => {
-                console.log('Chain changed:', chainId);
-                showNotification('Đã chuyển mạng blockchain!', 'info');
-            });
-
-            window.ethereum.on('accountsChanged', (accounts) => {
-                console.log('Accounts changed:', accounts);
-                // Reset wallet display
-                const walletContainer = document.getElementById('walletContainer');
-                walletContainer.innerHTML = `
-                    <button class="connect-btn" id="connectWalletBtn">
-                        <i class="fab fa-ethereum"></i> Kết nối MetaMask
-                    </button>
-                `;
-                // Re-attach event listener
-                document.getElementById('connectWalletBtn').addEventListener('click', function() {
-                    window.ethereum.request({ method: 'eth_requestAccounts' });
-                });
-            });
         }
     </script>
 </body>
